@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_term() {
+  >&2 echo "TERM"
+  exit 0
+}
+trap "_term" TERM
+
+_err() {
+  >&2 echo "err: $*"
+  exit 1
+}
+
+
+TARGET_POD=${1:-}
+TARGET_CONTAINER=${2:-}
+TARGET_PID=${3:-}
+
+[ -z "$TARGET_POD" ] \
+|| [ -z "$TARGET_CONTAINER" ] \
+|| [ -z "$TARGET_PID" ] && _err "USAGE: kubectl podstrace <pod> <container> <pid>"
+
+TARGET_NODE=$(kubectl get pod "$TARGET_POD" -o jsonpath='{.spec.nodeName}')
+
+IMAGE="alpine"
+set +e
+  NSENTER_POD_NAME="podstrace-$(env LC_CTYPE=C tr -dc a-z0-9 < /dev/urandom | head -c 6)"
+set -e
+
+OVERRIDES="$(cat <<EOT
+{
+  "spec": {
+    "nodeName": "$TARGET_NODE",
+    "hostPID": true,
+    "containers": [
+      {
+        "securityContext": {
+          "privileged": true
+        },
+        "image": "$IMAGE",
+        "name": "nsenter",
+        "stdin": true,
+        "stdinOnce": true,
+        "tty": true,
+        "command": [ "nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid", "--", "bash", "-c",
+          "container_id=\$(docker ps -f label=io.kubernetes.pod.name=$TARGET_POD -f label=io.kubernetes.container.name=$TARGET_CONTAINER -q) && \
+          echo \$container_id && \
+          docker cp \$(which strace) \$container_id:/usr/bin \
+          && docker exec --privileged --user 0 \$container_id killall strace \
+          ; docker exec --privileged --user 0 \$container_id strace -tt -T -f -p $TARGET_PID"]
+      }
+    ]
+  }
+}
+EOT
+)"
+
+echo "spawning \"$NSENTER_POD_NAME\" on \"$TARGET_NODE\""
+kubectl run --rm --image alpine --overrides="$OVERRIDES" --generator=run-pod/v1 -ti "$NSENTER_POD_NAME"
